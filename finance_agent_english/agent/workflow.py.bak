@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Workflow - 分步执行架构
+流程：
+1. 阶段一：收集宏观数据（所有必填数据填完才进下一步）
+2. 阶段二：基于完整宏观数据做宏观分析
+3. 阶段三：逐个收集十只股票数据 + 逐个分析
+4. 阶段四：整合所有内容生成最终报告
+"""
+
+import os
+import json
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+from agent.llm_client import LLMClient
+from agent.tool_registry import ToolRegistry
+
+from tools.web_search import web_search, TOOL_DEFINITION as SEARCH_TOOL
+from tools.web_fetch import web_fetch, TOOL_DEFINITION as FETCH_TOOL
+
+
+class FinanceAnalysisWorkflow:
+    """US Stock Analysis Workflow - Phased Execution Version"""
+
+    # 默认十大股票：科技×4 / 金融×2 / 消费×3 / 价值×1，满足板块均衡要求
+    DEFAULT_STOCKS = [
+        {"name": "NVIDIA", "symbol": "NVDA"},
+        {"name": "Apple", "symbol": "AAPL"},
+        {"name": "Microsoft", "symbol": "MSFT"},
+        {"name": "Advanced Micro Devices", "symbol": "AMD"},
+        {"name": "JPMorgan Chase", "symbol": "JPM"},
+        {"name": "Bank of America", "symbol": "BAC"},
+        {"name": "Costco Wholesale", "symbol": "COST"},
+        {"name": "Coca-Cola", "symbol": "KO"},
+        {"name": "Visa", "symbol": "V"},
+        {"name": "Berkshire Hathaway B", "symbol": "BRK.B"},
+    ]
+
+    def __init__(self, llm_client: LLMClient, config_dir: str = "config", prompt_dir: str = "prompt"):
+        self.llm = llm_client
+        self.config_dir = config_dir
+        self.prompt_dir = prompt_dir
+
+        # 初始化工具注册器
+        self.tools = ToolRegistry()
+        self._register_tools()
+
+    def _register_tools(self) -> None:
+        """注册所有可用工具"""
+        self.tools.register(
+            name="web_search",
+            description="Search the web for the latest financial information, data, and news. Used to find macroeconomic data, latest stock prices, and news events.",
+            parameters=SEARCH_TOOL,
+            func=web_search,
+        )
+        self.tools.register(
+            name="web_fetch",
+            description="Get the full text content of a specified webpage, extracting detailed data from authoritative sources.",
+            parameters=FETCH_TOOL,
+            func=web_fetch,
+        )
+
+    def _format_tool_call(self, tool_call: Dict[str, Any]) -> str:
+        """格式化工具调用结果为文本"""
+        name = tool_call.get("function", {}).get("name")
+        args = json.loads(tool_call.get("function", {}).get("arguments", "{}"))
+        result = self.tools.execute(name, **args)
+        return f"\nTool call result [{name}]:\n{result}\n"
+
+    def _read_prompt_template(self, filename: str) -> str:
+        """读取prompt模板"""
+        path = os.path.join(self.prompt_dir, filename)
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def _render_template(self, template: str, context: Dict[str, Any]) -> str:
+        """简单模板渲染"""
+        result = template
+        for key, value in context.items():
+            result = result.replace("{{" + key + "}}", str(value))
+        return result
+
+    def _run_llm_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.1,
+        max_turns: int = 15,
+    ) -> str:
+        """运行LLM+工具调用循环，直到得到最终回答"""
+        for turn in range(max_turns):
+            url = f"{self.llm.base_url}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {self.llm.api_key}",
+                "Content-Type": "application/json",
+            }
+            data = {
+                "model": self.llm.model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": self.llm.max_tokens,
+                "tools": self.tools.get_openai_tools(),
+                "tool_choice": "auto",
+            }
+
+            import requests
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            
+            session = requests.Session()
+            session.trust_env = False
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=2,
+                status_forcelist=[429, 500, 502, 503, 504]
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            session.mount("https://", adapter)
+            response = session.post(url, headers=headers, json=data, timeout=600, proxies=None)
+            response.raise_for_status()
+            result = response.json()
+            choice = result["choices"][0]
+            message = choice["message"]
+
+            # 检查是否有工具调用
+            if "tool_calls" in message and message["tool_calls"]:
+                for tool_call in message["tool_calls"]:
+                    result_text = self._format_tool_call(tool_call)
+                    print(f"   ✅ 工具执行完成: {tool_call['function']['name']}")
+                    messages.append(message)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": tool_call["function"]["name"],
+                        "content": result_text,
+                    })
+                continue
+
+            # 没有工具调用，返回最终回答
+            return message["content"].strip()
+
+        raise RuntimeError(f"Exceeded maximum turns {max_turns} without completion")
+
+    def _collect_macro_data(self, system_prompts: List[str], temperature: float) -> str:
+        """Phase 1: Collect macroeconomic data"""
+        print("\n📊 Phase 1: Collecting macroeconomic data")
+        template = self._read_prompt_template("01_macro_collect.md")
+
+        messages = []
+        for sp in system_prompts:
+            messages.append({"role": "system", "content": sp})
+        messages.append({"role": "user", "content": template})
+
+        result = self._run_llm_with_tools(messages, temperature, max_turns=25)
+        print("   ✅ Macro data collection complete")
+        return result
+
+    def _analyze_macro(self, system_prompts: List[str], macro_data: str, temperature: float) -> str:
+        """Phase 2: Macro analysis"""
+        print("\n📊 Phase 2: Macroeconomic analysis")
+        template = self._read_prompt_template("02_macro_analyze.md")
+        prompt = self._render_template(template, {"macro_data": macro_data})
+
+        messages = []
+        for sp in system_prompts:
+            messages.append({"role": "system", "content": sp})
+        messages.append({"role": "user", "content": prompt})
+
+        result = self._run_llm_with_tools(messages, temperature, max_turns=20)
+        print("   ✅ Macro analysis complete")
+        return result
+
+    def _analyze_single_stock(
+        self,
+        system_prompts: List[str],
+        macro_analysis: str,
+        stock: Dict[str, str],
+        index: int,
+        temperature: float,
+    ) -> str:
+        """Phase 3: Analyze single stock"""
+        symbol = stock["symbol"]
+        name = stock["name"]
+        print(f"\n📊 Phase 3: Analyzing stock {index}/10 - {name} ({symbol})")
+
+        template = self._read_prompt_template("03_stock_analyze.md")
+        context = {
+            "macro_analysis": macro_analysis,
+            "stock_name": name,
+            "stock_symbol": symbol,
+            "stock_index": index,
+        }
+        prompt = self._render_template(template, context)
+
+        messages = []
+        for sp in system_prompts:
+            messages.append({"role": "system", "content": sp})
+        messages.append({"role": "user", "content": prompt})
+
+        result = self._run_llm_with_tools(messages, temperature, max_turns=20)
+        print(f"   ✅ {name} analysis complete")
+        return result
+
+    def _compile_final_report(
+        self,
+        system_prompts: List[str],
+        macro_data: str,
+        macro_analysis: str,
+        stock_analyses: List[str],
+        temperature: float,
+    ) -> str:
+        """Phase 4: Compile final report"""
+        print("\n📊 Phase 4: Compiling final report")
+
+        # Extract S&P 500 and Nasdaq 100 values (simple search from macro_data)
+        sp500_value = ""
+        ndx_value = ""
+        for line in macro_data.split('\n'):
+            if 'S&P 500' in line and '|' in line:
+                parts = [p.strip() for p in line.split('|')]
+                if len(parts) >= 3:
+                    sp500_value = parts[2]
+            if 'Nasdaq 100' in line and '|' in line:
+                parts = [p.strip() for p in line.split('|')]
+                if len(parts) >= 3:
+                    ndx_value = parts[2]
+
+        template = self._read_prompt_template("04_final_compile.md")
+        today = datetime.now().strftime("%B %d, %Y")
+        current_time = datetime.now().strftime("%B %d, %Y %H:%M")
+
+        # Render template, handle stock block loop
+        prompt = template
+        prompt = prompt.replace("{{macro_data}}", macro_data)
+        prompt = prompt.replace("{{macro_analysis}}", macro_analysis)
+        prompt = prompt.replace("{{sp500_value}}", sp500_value)
+        prompt = prompt.replace("{{ndx_value}}", ndx_value)
+        prompt = prompt.replace("{{today}}", today)
+        prompt = prompt.replace("{{current_time}}", current_time)
+
+        # Handle stock loop
+        if "{% for stock in stock_analyses %}" in prompt:
+            # Find start and end of stock loop
+            lines = prompt.split('\n')
+            new_lines = []
+            in_loop = False
+            loop_content = []
+            for line in lines:
+                if "{% for stock in stock_analyses %}" in line:
+                    in_loop = True
+                    continue
+                if "{% endfor %}" in line:
+                    in_loop = False
+                    # Concatenate all stock analyses
+                    for stock in stock_analyses:
+                        for ll in loop_content:
+                            new_lines.append(ll.replace("{{stock}}", stock))
+                    continue
+                if in_loop:
+                    loop_content.append(line)
+                else:
+                    new_lines.append(line)
+            prompt = '\n'.join(new_lines)
+
+        messages = []
+        for sp in system_prompts:
+            messages.append({"role": "system", "content": sp})
+        messages.append({"role": "user", "content": prompt})
+
+        # Final step doesn't need tools, direct LLM integration
+        result = self.llm.complete(system_prompts, prompt, temperature)
+        print("   ✅ Final report generation complete")
+        return result
+
+    def run(
+        self,
+        output_dir: str = "output",
+        temperature: float = 0.1,
+        max_turns: int = 40,  # Total turns limit, each phase controlled separately
+    ) -> Tuple[str, str]:
+        """Run complete phased analysis workflow"""
+
+        from agent.prompt_builder import PromptBuilder
+        builder = PromptBuilder(self.config_dir)
+        system_prompts, _ = builder.build_full_prompt_components()
+
+        print("=" * 60)
+        print("🚀 Starting US Stock Deep Analysis Workflow (Phased Execution)")
+        print(f"🕒 Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 60)
+        print()
+        print(f"📝 Loaded layered configuration:")
+        print(f"   - IDENTITY: {len(system_prompts[0])} chars")
+        print(f"   - SOUL: {len(system_prompts[1])} chars")
+        print(f"   - Finance: {len(system_prompts[2])} chars")
+        print()
+        print(f"🎯 Analysis target: 10 stocks - " + ", ".join(s["symbol"] for s in self.DEFAULT_STOCKS))
+        print()
+
+        # Phase 1: Collect macro data
+        macro_data = self._collect_macro_data(system_prompts, temperature)
+
+        # Count missing data
+        missing = macro_data.count("[Data Not Available]")
+        if missing > 0:
+            print(f"   ⚠️  {missing} instances of [Data Not Available] in macro data, continuing analysis (no fabrication)")
+
+        # Phase 2: Macro analysis
+        macro_analysis = self._analyze_macro(system_prompts, macro_data, temperature)
+
+        # Phase 3: Analyze each of the 10 stocks
+        stock_analyses = []
+        for i, stock in enumerate(self.DEFAULT_STOCKS, 1):
+            analysis = self._analyze_single_stock(system_prompts, macro_analysis, stock, i, temperature)
+            stock_analyses.append(analysis)
+
+        # Phase 4: Compile final report
+        final_report = self._compile_final_report(
+            system_prompts, macro_data, macro_analysis, stock_analyses, temperature
+        )
+
+        # Save to file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"US_Stock_Deep_Analysis_Report_{timestamp}.md"
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, filename)
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(final_report)
+
+        # Generate HTML version for web viewing
+        from web_renderer import save_html_report, get_file_url
+        html_path = save_html_report(final_report, output_dir, timestamp)
+        html_url = get_file_url(html_path)
+
+        # Report completion
+        print(f"\n============================================================")
+        print(f"✅ Full workflow complete!")
+        print(f"📄 Markdown report: {output_path}")
+        print(f"🔗 Click to view:   {html_url}")
+        print(f"============================================================")
+
+        return final_report, output_path

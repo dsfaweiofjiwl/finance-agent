@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Web Renderer - Convert Markdown reports to self-contained HTML for browser viewing
+"""
+
+import os
+import re
+import glob
+import socket
+from datetime import datetime
+
+try:
+    import markdown
+    _HAS_MARKDOWN = True
+except ImportError:
+    _HAS_MARKDOWN = False
+
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
+<style>
+  :root {{
+    --bg: #f8f9fa;
+    --card-bg: #ffffff;
+    --text: #1a1a2e;
+    --text-secondary: #555770;
+    --border: #e0e0e0;
+    --accent: #1a5276;
+    --accent-light: #2980b9;
+    --table-header: #1a5276;
+    --table-stripe: #f2f6fa;
+    --table-border: #c8d6e5;
+    --red: #c0392b;
+    --green: #27ae60;
+  }}
+
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 20px;
+  }}
+
+  .container {{
+    max-width: 960px;
+    margin: 0 auto;
+    background: var(--card-bg);
+    border-radius: 8px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+    padding: 40px 48px;
+  }}
+
+  h1 {{
+    font-size: 1.8em;
+    color: var(--accent);
+    border-bottom: 3px solid var(--accent);
+    padding-bottom: 12px;
+    margin-bottom: 24px;
+  }}
+
+  h2 {{
+    font-size: 1.4em;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+    margin-top: 36px;
+    margin-bottom: 16px;
+  }}
+
+  h3 {{
+    font-size: 1.15em;
+    color: var(--text);
+    margin-top: 24px;
+    margin-bottom: 10px;
+  }}
+
+  h4 {{
+    font-size: 1.05em;
+    color: var(--text-secondary);
+    margin-top: 18px;
+    margin-bottom: 8px;
+  }}
+
+  p {{ margin-bottom: 14px; }}
+
+  strong {{ color: var(--text); font-weight: 600; }}
+
+  ul, ol {{
+    margin: 10px 0 14px 24px;
+  }}
+
+  li {{ margin-bottom: 4px; }}
+
+  hr {{
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 28px 0;
+  }}
+
+  blockquote {{
+    border-left: 4px solid var(--accent-light);
+    background: var(--table-stripe);
+    padding: 12px 20px;
+    margin: 16px 0;
+    border-radius: 0 4px 4px 0;
+  }}
+
+  code {{
+    background: #eef1f5;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 0.9em;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+  }}
+
+  pre {{
+    background: #1a1a2e;
+    color: #e0e0e0;
+    padding: 16px 20px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 14px 0;
+    font-size: 0.88em;
+    line-height: 1.5;
+  }}
+
+  pre code {{
+    background: none;
+    padding: 0;
+    color: inherit;
+  }}
+
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 0.92em;
+  }}
+
+  th {{
+    background: var(--table-header);
+    color: #fff;
+    padding: 10px 14px;
+    text-align: left;
+    font-weight: 600;
+  }}
+
+  td {{
+    padding: 9px 14px;
+    border: 1px solid var(--table-border);
+  }}
+
+  tr:nth-child(even) td {{
+    background: var(--table-stripe);
+  }}
+
+  tr:hover td {{
+    background: #e8f0fe;
+  }}
+
+  a {{
+    color: var(--accent-light);
+    text-decoration: none;
+  }}
+
+  a:hover {{
+    text-decoration: underline;
+  }}
+
+  .meta {{
+    color: var(--text-secondary);
+    font-size: 0.9em;
+    margin-bottom: 24px;
+  }}
+
+  @media (max-width: 640px) {{
+    .container {{ padding: 20px; }}
+    h1 {{ font-size: 1.4em; }}
+    table {{ font-size: 0.82em; }}
+    th, td {{ padding: 6px 8px; }}
+  }}
+</style>
+</head>
+<body>
+<div class="container">
+<p class="meta">Generated: {generated_time}</p>
+{body}
+</div>
+</body>
+</html>"""
+
+
+def _simple_md_to_html(md: str) -> str:
+    """Zero-dependency Markdown -> HTML fallback (used when `markdown` package is not installed)."""
+    lines = md.split('\n')
+    out = []
+    in_code = False
+    code_buf = []
+    in_table = False
+    table_rows = []
+    in_list = False
+
+    def escape_html(s: str) -> str:
+        return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+    def inline_fmt(s: str) -> str:
+        s = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', s)
+        s = re.sub(r'\*(.+?)\*', r'<em>\1</em>', s)
+        s = re.sub(r'`(.+?)`', r'<code>\1</code>', s)
+        s = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', s)
+        return s
+
+    for line in lines:
+        if line.startswith('```'):
+            if in_code:
+                out.append(f'<pre><code>{escape_html(chr(10).join(code_buf))}</code></pre>')
+                code_buf = []
+                in_code = False
+            else:
+                in_code = True
+            continue
+
+        if in_code:
+            code_buf.append(line)
+            continue
+
+        stripped = line.strip()
+
+        # Table
+        if stripped.startswith('|') and stripped.endswith('|'):
+            if in_list:
+                out.append('</ul>')
+                in_list = False
+            in_table = True
+            cells = [c.strip() for c in stripped[1:-1].split('|')]
+            if all(set(c) <= set('- :') for c in cells):
+                continue
+            tag = 'th' if len(table_rows) == 0 else 'td'
+            row_html = ''.join(f'<{tag}>{inline_fmt(escape_html(c))}</{tag}>' for c in cells)
+            table_rows.append(f'<tr>{row_html}</tr>')
+            continue
+        elif in_table:
+            out.append(f'<table>{"".join(table_rows)}</table>')
+            table_rows = []
+            in_table = False
+
+        # List
+        is_list_item = stripped.startswith('- ') or stripped.startswith('* ')
+        if is_list_item:
+            if not in_list:
+                out.append('<ul>')
+                in_list = True
+            out.append(f'<li>{inline_fmt(escape_html(stripped[2:]))}</li>')
+            continue
+
+        if in_list:
+            if stripped == '':
+                continue
+            out.append('</ul>')
+            in_list = False
+
+        if stripped.startswith('# '):
+            out.append(f'<h1>{inline_fmt(escape_html(stripped[2:]))}</h1>')
+        elif stripped.startswith('## '):
+            out.append(f'<h2>{inline_fmt(escape_html(stripped[3:]))}</h2>')
+        elif stripped.startswith('### '):
+            out.append(f'<h3>{inline_fmt(escape_html(stripped[4:]))}</h3>')
+        elif stripped.startswith('#### '):
+            out.append(f'<h4>{inline_fmt(escape_html(stripped[5:]))}</h4>')
+        elif stripped.startswith('> '):
+            out.append(f'<blockquote>{inline_fmt(escape_html(stripped[2:]))}</blockquote>')
+        elif stripped == '':
+            out.append('<br>')
+        else:
+            out.append(f'<p>{inline_fmt(escape_html(stripped))}</p>')
+
+    if in_table:
+        out.append(f'<table>{"".join(table_rows)}</table>')
+    if in_code and code_buf:
+        out.append(f'<pre><code>{escape_html(chr(10).join(code_buf))}</code></pre>')
+    if in_list:
+        out.append('</ul>')
+
+    return '\n'.join(out)
+
+
+def render_report_html(markdown_text: str, title: str = "US Stock Deep Analysis Report") -> str:
+    """Convert Markdown report to a self-contained HTML string."""
+    if _HAS_MARKDOWN:
+        body = markdown.markdown(
+            markdown_text,
+            extensions=["tables", "fenced_code", "toc"],
+        )
+    else:
+        print("[WARN] `markdown` package not installed, using simplified rendering. Run: pip install markdown")
+        body = _simple_md_to_html(markdown_text)
+
+    generated_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return HTML_TEMPLATE.format(title=title, body=body, generated_time=generated_time)
+
+
+def save_html_report(markdown_text: str, output_dir: str, timestamp: str = None) -> str:
+    """Convert Markdown to HTML and save alongside the .md file. Returns HTML path."""
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    filename = f"US_Stock_Deep_Analysis_Report_{timestamp}.html"
+    os.makedirs(output_dir, exist_ok=True)
+    html_path = os.path.join(output_dir, filename)
+
+    html_content = render_report_html(markdown_text)
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    return html_path
+
+
+def get_file_url(path: str) -> str:
+    """Return a file:// URL for the given path."""
+    abs_path = os.path.abspath(path)
+    return f"file://{abs_path}"
+
+
+def get_http_url(html_path: str, port: int = 0) -> str:
+    """Return an http://localhost URL for the given HTML file.
+    If port is 0, picks the same port that serve_report() would use."""
+    if port == 0:
+        port = _pick_port()
+    filename = os.path.basename(html_path)
+    return f"http://127.0.0.1:{port}/{filename}"
+
+
+def _pick_port() -> int:
+    """Find a free port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def serve_report(html_path: str, open_browser: bool = True) -> None:
+    """Start a local HTTP server to serve the HTML report.
+    Blocks until Ctrl+C is pressed.
+    This is the recommended way to view reports (avoids file:// browser restrictions)."""
+    import http.server
+    import socketserver
+    import webbrowser
+
+    serve_dir = os.path.dirname(os.path.abspath(html_path))
+    filename = os.path.basename(html_path)
+    port = _pick_port()
+
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=serve_dir, **kwargs)
+
+        def log_message(self, format, *args):
+            pass
+
+    class ReusableServer(socketserver.TCPServer):
+        allow_reuse_address = True
+
+    server = ReusableServer(("127.0.0.1", port), QuietHandler)
+    url = f"http://127.0.0.1:{port}/{filename}"
+
+    if open_browser:
+        webbrowser.open(url)
+
+    print(f"Serving report at: {url}")
+    print("Press Ctrl+C to stop the server.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+    finally:
+        server.server_close()
+
+
+def open_report(path: str) -> None:
+    """Open an HTML report file in the default browser."""
+    import webbrowser
+    abs_path = os.path.abspath(path)
+    if not os.path.isfile(abs_path):
+        print(f"File not found: {abs_path}")
+        return
+    webbrowser.open(get_file_url(abs_path))
+    print(f"Opened in browser: {abs_path}")
+
+
+def list_reports(output_dir: str = "output") -> list:
+    """List all HTML reports in the output directory, newest first."""
+    pattern = os.path.join(output_dir, "US_Stock_Deep_Analysis_Report_*.html")
+    files = glob.glob(pattern)
+    files.sort(reverse=True)
+    return files
+
+
+def interactive_open(output_dir: str = "output") -> None:
+    """Interactive CLI: list reports and let the user pick one to open."""
+    reports = list_reports(output_dir)
+
+    if not reports:
+        print(f"No HTML reports found in {output_dir}/")
+        print("Run 'python run_analysis.py' first to generate a report.")
+        return
+
+    print("\nAvailable Reports:")
+    print("-" * 60)
+    for i, path in enumerate(reports, 1):
+        name = os.path.basename(path)
+        size_kb = os.path.getsize(path) / 1024
+        url = get_file_url(path)
+        print(f"  [{i}] {name}  ({size_kb:.0f} KB)")
+        print(f"      {url}")
+    print("-" * 60)
+
+    try:
+        choice = input("\nEnter number to open (or q to quit): ").strip()
+        if choice.lower() == "q":
+            return
+        idx = int(choice) - 1
+        if 0 <= idx < len(reports):
+            open_report(reports[idx])
+        else:
+            print("Invalid choice.")
+    except (ValueError, EOFError):
+        print("Cancelled.")

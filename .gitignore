@@ -1,0 +1,30 @@
+# Development
+.env
+.env.local
+.env.*.local
+
+# Claude Code
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Checkpoints (may contain API responses)
+data/checkpoints/
+output/
+*.db-shm
+*.db-wal
+data/checkpoints/
+**/data/checkpoints/
